@@ -43,12 +43,18 @@ async def main():
     log_info("Crawling Tavily", Colors.PURPLE)
     res = tavily_crawl.invoke({
         "url": "https://python.langchain.com/",
-        "max_depth": 1,
+        "max_depth": 2,
         "extract_depth": "advanced",
         "instructions": "content on ai agents"
     })
     all_docs = [Document(page_content=result['raw_content'], metadata=result) for result in res["results"]]
     log_success(f"Crawled {len(all_docs)} documents")
+
+    # Split documents info chunks
+    log_info("TEXT SPLITTING", Colors.CYAN)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=200)
+    splitter_docs = text_splitter.split_documents(all_docs)
+    log_success(f"Split into {len(splitter_docs)} chunks")
 
 
 
