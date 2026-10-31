@@ -1,4 +1,6 @@
 from typing import Any, Dict, List
+from urllib.parse import urlparse
+
 import streamlit as st
 from backend.core import run_llm
 
@@ -10,8 +12,13 @@ def _format_sources(context_docs: List[Any]) -> List[str]:
 	for doc in context_docs or []:
 		metadata = getattr(doc, "metadata", None) or {}
 		source = str(metadata.get("source") or metadata.get("url") or "").strip()
+		parsed_source = urlparse(source)
 
-		if not source or source.casefold() == "unknown" or source in seen:
+		if (
+			parsed_source.scheme not in {"http", "https"}
+			or not parsed_source.netloc
+			or source in seen
+		):
 			continue
 
 		seen.add(source)

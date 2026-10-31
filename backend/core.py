@@ -1,7 +1,13 @@
 import os
 import re
+import socket
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from ipaddress import ip_address
 from typing import Any, Dict, Literal, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
@@ -85,6 +91,13 @@ RETRIEVAL_RELEVANCE_THRESHOLD = float(
 	os.getenv("RETRIEVAL_RELEVANCE_THRESHOLD", "0.55")
 )
 MAX_HISTORY_MESSAGES = 6
+SOURCE_VALIDATION_TIMEOUT = float(os.getenv("SOURCE_VALIDATION_TIMEOUT", "3.0"))
+SOURCE_VALIDATION_WORKERS = 4
+MARKDOWN_LINK_PATTERN = re.compile(
+	r"\[([^\]]+)]\(https?://[^)\s]+\)",
+	flags=re.IGNORECASE,
+)
+BARE_URL_PATTERN = re.compile(r"https?://[^\s<>]+", flags=re.IGNORECASE)
 
 
 def _normalize_query(query: str) -> str:
@@ -178,6 +191,99 @@ def _message_text(message: Any) -> str:
 	).strip()
 
 
+def _document_source(document: Any) -> str:
+	"""Read an HTTP source URL from document metadata."""
+	metadata = getattr(document, "metadata", None) or {}
+	return str(metadata.get("source") or metadata.get("url") or "").strip()
+
+
+def _is_public_http_url(url: str) -> bool:
+	"""Reject malformed URLs and hosts that resolve to local or private networks."""
+	parsed = urlparse(url)
+
+	if (
+		parsed.scheme not in {"http", "https"}
+		or not parsed.hostname
+		or parsed.username
+		or parsed.password
+	):
+		return False
+
+	try:
+		default_port = 80 if parsed.scheme == "http" else 443
+		addresses = socket.getaddrinfo(parsed.hostname, parsed.port or default_port)
+	except OSError:
+		return False
+
+	for address in addresses:
+		try:
+			value = ip_address(address[4][0].split("%", maxsplit=1)[0])
+		except ValueError:
+			return False
+
+		if not value.is_global:
+			return False
+
+	return True
+
+
+@lru_cache(maxsize=512)
+def _reachable_source_url(url: str) -> str | None:
+	"""Return the final URL when a public source responds without an HTTP error."""
+	if not _is_public_http_url(url):
+		return None
+
+	request = Request(
+		url,
+		headers={
+			"Accept": "text/html,application/xhtml+xml",
+			"Range": "bytes=0-0",
+			"User-Agent": "DocumentationHelper/1.0 source-validator",
+		},
+		method="GET",
+	)
+
+	try:
+		with urlopen(request, timeout=SOURCE_VALIDATION_TIMEOUT) as response:
+			if 200 <= response.status < 400:
+				return response.geturl()
+	except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+		return None
+
+	return None
+
+
+def _documents_with_reachable_sources(documents: Sequence[Any]) -> list[Any]:
+	"""Keep documents whose source URLs exist and store their final redirect URLs."""
+	if not documents:
+		return []
+
+	sources = [_document_source(document) for document in documents]
+	worker_count = min(SOURCE_VALIDATION_WORKERS, len(sources))
+
+	with ThreadPoolExecutor(max_workers=worker_count) as executor:
+		resolved_sources = list(executor.map(_reachable_source_url, sources))
+
+	validated_documents = []
+
+	for document, resolved_source in zip(documents, resolved_sources):
+		if not resolved_source:
+			continue
+
+		document.metadata = dict(document.metadata or {})
+		document.metadata["source"] = resolved_source
+		validated_documents.append(document)
+
+	return validated_documents
+
+
+def _strip_unverified_links(answer: str) -> str:
+	"""Remove model-generated links; verified sources are rendered separately by the UI."""
+	answer = MARKDOWN_LINK_PATTERN.sub(r"\1", answer)
+	answer = BARE_URL_PATTERN.sub("", answer)
+	return "\n".join(line.rstrip() for line in answer.splitlines()).strip()
+
+
 @tool(response_format="content_and_artifact")
 def retrieve_context(query: str):
 	"""Retrieve only sufficiently relevant context from the vector store."""
@@ -188,7 +294,7 @@ def retrieve_context(query: str):
 			"score_threshold": RETRIEVAL_RELEVANCE_THRESHOLD,
 		},
 	)
-	retrieved_docs = retriever.invoke(query)
+	retrieved_docs = _documents_with_reachable_sources(retriever.invoke(query))
 
 	if not retrieved_docs:
 		return (
@@ -253,6 +359,8 @@ def run_llm(
 		"Call retrieve_context exactly once before answering. "
 		"Do not answer questions outside the LangChain ecosystem. "
 		"Base the answer on retrieved documentation, not general model knowledge. "
+		"Do not create Markdown links, citations, or URLs in the answer because the "
+		"application renders verified source links separately. "
 		"If no sufficiently relevant documentation is returned, say that the answer "
 		"was not found in the indexed documentation."
 	)
@@ -265,7 +373,7 @@ def run_llm(
 	messages = _history_messages(chat_history)
 	messages.append({"role": "user", "content": query})
 	response = agent.invoke({"messages": messages})
-	answer = _message_text(response["messages"][-1])
+	answer = _strip_unverified_links(_message_text(response["messages"][-1]))
 	context_docs = []
 
 	for message in response["messages"]:
